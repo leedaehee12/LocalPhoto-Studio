@@ -40,6 +40,10 @@ from PySide6.QtWidgets import (
 # 같은 폴더의 processing.py에서 보정 함수를 가져옵니다.
 from processing import apply_adjustments
 
+# 내보내기 작업을 담당하는 별도 모듈
+from export_worker import ExportThread
+
+
 
 class MainWindow(QMainWindow):
     """프로그램의 메인 창입니다."""
@@ -50,6 +54,16 @@ class MainWindow(QMainWindow):
 
         self.setWindowTitle("LocalPhoto Studio")
         self.resize(1200, 800)
+        
+        
+        # 현재 불러온 원본 사진의 경로
+        # 사진을 열기 전에는 None입니다.
+        self.current_file_path = None
+        
+        # 현재 진행 중인 저장 작업 스레드
+        # 작업이 없으면 None입니다.
+        self.export_thread = None
+    
 
         # original_image:
         # 파일에서 불러온 원본 QImage 객체
@@ -225,7 +239,8 @@ class MainWindow(QMainWindow):
 
         # 생성한 두 객체를 호출한 함수에 돌려줍니다.
         return slider, value_label
-
+    
+        
     def create_menu(self):
         """파일 메뉴를 생성합니다."""
 
@@ -242,6 +257,30 @@ class MainWindow(QMainWindow):
         )
 
         file_menu.addAction(open_action)
+        
+        # ===== 다른 이름으로 저장 =====
+        
+        # Qaction : 메뉴에서 선택하는 명령 객체
+        self.save_action = QAction(
+            "다른 이름으로 저장...",
+            self
+        )
+        
+        # Ctrl + Shift + S 단축키 지정
+        self.save_action.setShortcut(
+            "Ctrl+Shift+S"
+        )
+        
+        # 메뉴 선택 시 export_image() 함수 호출
+        self.save_action.triggered.connect(
+            self.export_image
+        )
+        
+        # 파일 메뉴에 저장명령 추가
+        file_menu.addAction(
+            self.save_action
+        )
+        
 
         exit_action = QAction("종료", self)
 
@@ -296,6 +335,12 @@ class MainWindow(QMainWindow):
 
         # 새 사진을 원본으로 저장합니다.
         self.original_image = loaded_image
+        
+        # 현재 사진이 저장되어 있던 위치를 기억합니다.
+        # 예: C:\Photos\portrait.jpg
+        
+        self.current_file_path = Path(file_path)
+        
 
         # 이전 사진의 축소 이미지 캐시를 제거합니다.
         self.preview_source = QImage()
@@ -316,6 +361,234 @@ class MainWindow(QMainWindow):
             f"{loaded_image.width()} × "
             f"{loaded_image.height()} px"
         )
+    
+    def export_image(self):
+        """
+        파일 저장 대화상자를 열고 내보내기를 시작합니다.
+        """
+        if self.original_image.isNull():
+            QMessageBox.warning(
+                self,
+                "저장 불가",
+                "먼저 사진을 불러오세요"
+            )
+            return
+        
+        # 이미 저장 중이면 두 번째 저장을 막습니다.
+        if self.export_thread is not None:
+            return
+        
+        # 원본 파일 이름에서 기본 출력 파일명을 만듭니다.
+        #
+        # 예: portrait.jpg -> portrait_edited.jpg
+        
+        suggested_path = (
+            self.current_file_path.with_name(
+                self.current_file_path.stem
+                + "_edited.jpg"
+            )
+        )
+        
+        file_filters = (
+            "JPEG 이미지 (*.jpg *.jpeg);;"
+            "PNG 이미지 (*.png)"
+        )
+        
+        # 파일 저장 위치를 사용자에게 선택받습니다.
+        #
+        # file_path: 선택한 저장 경로(str)
+        # selected_filter: 사용자가 선택한 파일 형식(str) 
+        
+        file_path, selected_filter =(
+            QFileDialog.getSaveFileName(
+                self,
+                "보정사진 저장",
+                str(suggested_path),
+                "JPEG 이미지 (*.jpg *.jpeg);;"
+                "PNG 이미지 (*.png)"
+            )
+        )
+        
+        # 취소
+        if not file_path:
+            return
+        
+        # 파일명을 Path 객체로 변환합니다.
+        output_path = Path(file_path)
+        
+        # 확장자를 입력하지 않았다면 선택한 형식으로 추가
+        if not output_path.suffix:
+            extension = (
+                ".png"
+                if selected_filter.startswith("PNG")
+                else ".jpg"
+            )
+            
+            # with_suffix()는 새 Path 객체를 반환합니다.
+            # 따라서 반환값을 output_path에 다시 저장합니다.
+            output_path = output_path.with_suffix(
+                extension
+            )
+            
+        # 허용한 형식만 저장합니다.
+        if output_path.suffix.lower() not in (
+            ".jpg", ".jpeg", ".png"
+        ):
+            QMessageBox.warning(
+                self,
+                "지원하지 않는 형식",
+                "JPG 또는 PNG 형식만 저장합니다."
+            )
+            return
+        # 원본과 출력 파일의 경로를 비교합니다.
+        # resolve()는 정규화된 절대 경로를 만듭니다.
+        if (
+            output_path.resolve()
+            == self.current_file_path.resolve()
+        ):
+            QMessageBox.warning(
+                self,
+                "원본 보호",
+                "원본 사진은 덮어쓰지 않습니다.\n"
+                "다른 파일명으로 저장하세요."
+            )
+            return
+        # 같은 이름의 파일이 존재하는 경우 확인
+        if output_path.exists():
+            answer = QMessageBox.question(
+                self,
+                "덮어쓰기 확인",
+                "같은 이름의 파일이 있습니다.\n"
+                "기존 파일을 덮어쓰시겠습니까?",
+                QMessageBox.StandardButton.Yes
+                | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No
+            )
+
+            if answer != QMessageBox.StandardButton.Yes:
+                return
+            # ===== 현재 보정값 저장 =====
+
+        # dict 형식으로 슬라이더 값을 수집합니다.
+        # 저장 작업 시작 시점의 값이 고정됩니다.
+        settings = {
+            "exposure_ev":
+                self.exposure_slider.value() / 10.0,
+
+            "contrast":
+                self.contrast_slider.value(),
+
+            "saturation":
+                self.saturation_slider.value(),
+
+            "warmth":
+                self.warmth_slider.value(),
+        }
+        # ===== 작업 스레드 생성 =====
+
+        # original_image를 전달하는 점이 중요합니다.
+        # preview_source를 전달하면 축소본이 저장됩니다.
+        self.export_thread = ExportThread(
+            source=self.original_image,
+            output_path=str(output_path),
+            settings=settings,
+            parent=self
+        )
+
+        # 성공 신호와 GUI 메서드 연결
+        self.export_thread.succeeded.connect(
+            self.on_export_success
+        )
+
+        # 오류 신호와 GUI 메서드 연결
+        self.export_thread.failed.connect(
+            self.on_export_error
+        )
+
+        # 스레드 종료 시 정리 메서드 실행
+        self.export_thread.finished.connect(
+            self.on_export_finished
+        )
+
+        # 중복 저장 방지
+        self.save_action.setEnabled(False)
+
+        self.statusBar().showMessage(
+            "원본 해상도 사진을 저장하는 중..."
+        )
+
+        # 별도 스레드에서 run() 실행
+        self.export_thread.start()
+        
+    def on_export_success(self, saved_path: str):
+        """
+        저장에 성공하면 실행됩니다.
+
+        saved_path:
+            실제 저장한 파일 경로(str)
+        """
+
+        self.statusBar().showMessage(
+            f"저장 완료: {saved_path}"
+        )
+
+        QMessageBox.information(
+            self,
+            "저장 완료",
+            f"사진을 저장했습니다.\n{saved_path}"
+        )
+
+    def on_export_error(self, error_message: str):
+        """
+        저장에 실패하면 실행됩니다.
+
+        error_message:
+            저장 엔진에서 전달한 오류 문자열
+        """
+
+        self.statusBar().showMessage(
+            "저장 실패"
+        )
+
+        QMessageBox.critical(
+            self,
+            "저장 오류",
+            error_message
+        )
+    def on_export_finished(self):
+        """저장 스레드가 종료된 뒤 자원을 정리합니다."""
+
+        # 저장 메뉴를 다시 활성화합니다.
+        self.save_action.setEnabled(True)
+
+        # Qt 객체 삭제를 이벤트 루프에 예약합니다.
+        self.export_thread.deleteLater()
+
+        # 작업이 끝났으므로 참조를 해제합니다.
+        self.export_thread = None
+
+    def closeEvent(self, event):
+        """저장 중 프로그램 종료를 방지합니다."""
+
+        if (
+            self.export_thread is not None
+            and self.export_thread.isRunning()
+        ):
+            QMessageBox.information(
+                self,
+                "저장 진행 중",
+                "사진 저장이 끝난 뒤 종료하세요."
+            )
+
+            # 창 닫기 이벤트를 취소합니다.
+            event.ignore()
+            return
+
+        # 저장 중이 아니면 정상 종료
+        super().closeEvent(event)    
+        
+        
+
 
     def update_value_labels(self):
         """현재 슬라이더의 값을 화면에 표시합니다."""
