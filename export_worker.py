@@ -1,197 +1,217 @@
 
 """
-LocalPhoto Studio - 이미지 내보내기 모듈
+원본 해상도 JPEG/PNG 내보내기.
 
-담당 기능:
-1. 원본 해상도로 이미지 보정
-2. JPG / PNG 인코딩
-3. 임시 파일을 이용한 안전한 저장
-4. 별도 스레드에서 처리
+GUI/이력 객체를 직접 제어하지 않습니다.
 """
 
 from pathlib import Path
+from typing import Mapping
 
 from PySide6.QtCore import (
     QIODevice,
     QSaveFile,
     QThread,
     Signal,
-    Qt,
+    Qt
 )
 
 from PySide6.QtGui import (
     QImage,
     QImageWriter,
-    QPainter,
+    QPainter
 )
 
-# 기존 사진 보정 함수를 재사용합니다.
+from models import AdjustmentSettings
 from processing import apply_adjustments
+
+
+def normalize_settings(
+    settings: AdjustmentSettings | Mapping[str, float | int],
+) -> AdjustmentSettings:
+    """
+    기존 dict 호출 방식도 지원합니다.
+
+    내부에서는 AdjustmentSettings 모델만 사용합니다.
+    """
+
+    if isinstance(settings, AdjustmentSettings):
+        return settings
+
+    return AdjustmentSettings(**dict(settings))
 
 
 def save_adjusted_image(
     source: QImage,
     output_path: str,
-    settings: dict,
+    settings: AdjustmentSettings | Mapping[str, float | int],
 ) -> None:
     """
-    원본 해상도의 보정 사진을 파일에 저장합니다.
-
-    source:
-        불러온 원본 QImage 객체
-
-    output_path:
-        저장할 파일의 전체 경로(str)
-
-    settings:
-        보정값을 담은 딕셔너리(dict)
-
-    반환값:
-        없음(None)
-        저장에 실패하면 예외를 발생시킵니다.
+    원본 해상도의 보정 사진을 안전하게 저장합니다.
+    오류 발생 시 예외를 발생시킵니다.
     """
 
-    # suffix: 파일 확장자를 소문자로 가져옵니다.
-    # 예: "photo.JPG" -> ".jpg"
-    suffix = Path(output_path).suffix.lower()
+    # path:
+    # 확장자 검사와 저장 위치 관리용 Path 객체
+    path = Path(output_path)
 
-    # 확장자와 Qt 이미지 형식의 대응표입니다.
-    # bytes 형식으로 전달합니다.
+    # suffix:
+    # 파일 확장자를 소문자로 변환
+    # 예: '.JPG' → '.jpg'
+    suffix = path.suffix.lower()
+
+    # 파일 확장자와 Qt 인코더 형식 대응표
     formats = {
         ".jpg": b"JPEG",
         ".jpeg": b"JPEG",
-        ".png": b"PNG",
+        ".png": b"PNG"
     }
 
     if suffix not in formats:
         raise ValueError(
-            "지원하는 형식은 JPG, JPEG, PNG입니다."
+            "지원하는 저장 형식은 JPG, JPEG, PNG입니다."
         )
 
-    # ===== 1. 원본 이미지 보정 =====
+    if source.isNull():
+        raise ValueError(
+            "저장할 원본 이미지가 없습니다."
+        )
 
-    # **settings는 딕셔너리 언패킹 문법입니다.
-    #
-    # 예:
-    # {"exposure_ev": 1.0, "contrast": 20}
-    # ->
-    # exposure_ev=1.0, contrast=20
-    #
-    # 입력 이미지는 화면용 축소본이 아닙니다.
+    # ===== 1. 보정 설정 정규화 =====
+
+    # snapshot:
+    # 저장 시작 시점의 불변 보정 설정입니다.
+    snapshot = normalize_settings(settings)
+
+    # ===== 2. 원본 해상도 보정 =====
+
+    # result:
+    # 화면 미리보기가 아닌 원본 전체를 보정한 QImage
     result = apply_adjustments(
         source,
-        **settings
+        **snapshot.as_kwargs()
     )
 
     if result.isNull():
         raise RuntimeError(
-            "보정 결과 이미지가 비어 있습니다."
+            "보정 결과가 비어 있습니다."
         )
 
-    # ===== 2. JPEG의 투명도 처리 =====
+    # ===== 3. JPEG 투명도 처리 =====
 
     if suffix in (".jpg", ".jpeg"):
 
         # JPEG는 투명도를 지원하지 않습니다.
-        # RGB888 형식의 새 이미지를 만듭니다.
+        # 불투명한 RGB 이미지 생성
         opaque = QImage(
             result.size(),
             QImage.Format.Format_RGB888
         )
 
-        # 전체 배경을 흰색으로 채웁니다.
+        if opaque.isNull():
+            raise MemoryError(
+                "JPEG용 이미지 메모리를 확보하지 못했습니다."
+            )
+
+        # 배경을 흰색으로 채웁니다.
         opaque.fill(Qt.GlobalColor.white)
 
-        # QPainter를 이용하여 기존 사진을
-        # 흰 배경 위에 합성합니다.
+        # 투명 영역을 흰 배경에 합성합니다.
         painter = QPainter(opaque)
-        painter.drawImage(0, 0, result)
-        painter.end()
+
+        try:
+            painter.drawImage(0, 0, result)
+        finally:
+            painter.end()
 
         result = opaque
-    # ===== 3. 안전한 저장 파일 생성 =====
 
-    # QSaveFile은 우선 임시 파일에 데이터를 씁니다.
-    # 쓰기가 끝나면 commit()으로 최종 저장합니다.
-    target_file = QSaveFile(output_path)
-    if not target_file.open(
+    # ===== 4. 임시 파일 생성 =====
+
+    # QSaveFile:
+    # 임시 파일에 기록한 뒤 성공 시 최종 저장합니다.
+    target = QSaveFile(str(path))
+
+    if not target.open(
         QIODevice.OpenModeFlag.WriteOnly
-    ) : 
+    ):
         raise OSError(
-            f"파일열기 실패 : {target_file.errorString()}"
+            f"파일 열기 실패: {target.errorString()}"
         )
-    # ===== 4. 이미지 인코더 생성 =====
+
+    # ===== 5. 인코더 생성 =====
 
     # writer:
-    # 이미지를 JPEG/PNG 바이트로 변환하는 객체
+    # JPEG 또는 PNG 바이트로 변환하는 QImageWriter 객체
     writer = QImageWriter(
-        target_file,
+        target,
         formats[suffix]
     )
-    
-    if suffix in (".jpg", ".jpeg"):
-        # JPEG 품질 95 (손실 압축)
-         writer.setQuality(95)
-         
-    if not writer.write(result):
-        
-       # 실패 원인을 문자열로 가져옵니다.
-        error_message = writer.errorString()
-       
-       # 임시 저장을 취소합니다.
-        target_file.cancelWriting() 
-        
-        raise OSError(
-            f"이미지기록실패 : {error_message}"
-        )
-        
-     # ===== 5. 저장 확정 =====
 
-     # 쓰기가 성공한 경우에만 최종 경로로 반영합니다.
-     
-    if not target_file.commit():
+    if suffix in (".jpg", ".jpeg"):
+        # JPEG 저장 품질
+        writer.setQuality(95)
+
+    # 실제 이미지 기록
+    if not writer.write(result):
+
+        message = writer.errorString()
+
+        # 저장이 실패했으므로 임시 파일 쓰기 취소
+        target.cancelWriting()
+
         raise OSError(
-            f"파일 저장 실패: {target_file.errorString()}"  
-         )
-        
+            f"이미지 인코딩 실패: {message}"
+        )
+
+    # ===== 6. 저장 확정 =====
+
+    if not target.commit():
+        raise OSError(
+            f"최종 저장 실패: {target.errorString()}"
+        )
+
+
 class ExportThread(QThread):
     """
-    이미지 저장 작업용 스레드입니다.
-
-    GUI 스레드와 분리하여 대용량 이미지 처리 중
-    프로그램 창의 반응성을 유지합니다.
+    백그라운드에서 사진을 저장합니다.
+    QWidget을 직접 조작하지 않습니다.
     """
 
-    # 성공 시 저장 경로(str)를 전달하는 신호
+    # 성공한 파일 경로(str)를 GUI에 전달
     succeeded = Signal(str)
-    # 실패 시 오류 메시지(str)를 전달하는 신호
+
+    # 오류 메시지(str)를 GUI에 전달
     failed = Signal(str)
-    
+
     def __init__(
         self,
-        source : QImage,
+        source: QImage,
         output_path: str,
-        settings: dict,
-        parent=None
-    ):
-        super().__init__(parent)
-        
-        # 원본 이미지를 복사해 저장합니다.
-        self.source = source.copy()
-        
-        # 저장할 파일 경로
-        self.output_path = output_path
-        
-        # 작업 시작 시점의 보정값 사본
-        self.settings = settings.copy()
-    
-    def run(self):
-        
-        """
-        start()를 호출하면 별도 스레드에서 실행됩니다.
+        settings: AdjustmentSettings | Mapping[str, float | int],
+        parent=None,
+    ) -> None:
 
-        이 함수 안에서는 GUI 위젯을 직접 조작하지 않습니다.
+        super().__init__(parent)
+
+        # source:
+        # 원본 이미지의 독립 사본
+        # 저장 중 다른 사진을 열어도 작업 데이터가 유지됩니다.
+        self.source = source.copy()
+
+        # output_path:
+        # 사용자가 선택한 저장 대상 전체 경로
+        self.output_path = output_path
+
+        # settings:
+        # 저장 시작 시점의 불변 보정 설정
+        self.settings = normalize_settings(settings)
+
+    def run(self) -> None:
         """
+        QThread.start()로 실행되는 작업 함수입니다.
+        """
+
         try:
             save_adjusted_image(
                 self.source,
@@ -199,19 +219,11 @@ class ExportThread(QThread):
                 self.settings
             )
 
-            # 작업 성공을 GUI에 알립니다.
-            self.succeeded.emit(
-                self.output_path
-            )
-
         except Exception as exc:
 
-            # 오류의 클래스 이름과 내용을 함께 전달합니다.
             self.failed.emit(
                 f"{type(exc).__name__}: {exc}"
             )
-        
-      
-         
-    
-   
+
+        else:
+            self.succeeded.emit(self.output_path)

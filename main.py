@@ -1,28 +1,21 @@
 
 """
-LocalPhoto Studio - 메인 GUI
+LocalPhoto Studio: PySide6 GUI.
 
-담당 기능:
-- 프로그램 창 구성
-- 사진 파일 불러오기
-- 보정 슬라이더 값 읽기
-- processing.py에 보정 요청
-- 결과 이미지를 화면에 표시
+편집 상태는 EditorController가 관리합니다.
 """
 
 import sys
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QEvent
-
+from PySide6.QtCore import QEvent, Qt, QTimer, Signal
 from PySide6.QtGui import (
     QAction,
     QImage,
     QImageReader,
     QKeySequence,
-    QPixmap,
+    QPixmap
 )
-
 from PySide6.QtWidgets import (
     QApplication,
     QFileDialog,
@@ -34,49 +27,113 @@ from PySide6.QtWidgets import (
     QSizePolicy,
     QSlider,
     QVBoxLayout,
-    QWidget,
+    QWidget
 )
 
-# 같은 폴더의 processing.py에서 보정 함수를 가져옵니다.
+from editor_controller import EditorController
+from export_worker import ExportThread
+from models import AdjustmentSettings
 from processing import apply_adjustments
 
-# 내보내기 작업을 담당하는 별도 모듈
-from export_worker import ExportThread
 
+class EditSlider(QSlider):
+    """
+    마우스 입력 시작을 QSlider 기본 값 변경보다
+    먼저 통보하는 확장 슬라이더입니다.
+    """
+
+    # 마우스를 누르는 시점에 전달
+    mouse_edit_started = Signal()
+
+    # 마우스를 놓은 뒤 전달
+    mouse_edit_finished = Signal()
+
+    def mousePressEvent(self, event) -> None:
+
+        if event.button() == Qt.MouseButton.LeftButton:
+
+            # Qt가 트랙 클릭으로 값을 바꾸기 전에
+            # 편집을 시작합니다.
+            self.mouse_edit_started.emit()
+
+        super().mousePressEvent(event)
+
+    def mouseReleaseEvent(self, event) -> None:
+
+        # Qt가 최종 슬라이더 값을 처리합니다.
+        super().mouseReleaseEvent(event)
+
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.mouse_edit_finished.emit()
 
 
 class MainWindow(QMainWindow):
-    """프로그램의 메인 창입니다."""
+    """
+    사진과 슬라이더를 보여주고
+    입력 의도를 Controller에 전달합니다.
+    """
 
-    def __init__(self):
-        # 부모 클래스인 QMainWindow의 초기화 수행
+    # 항목명: (최솟값, 최댓값, 화면 표시 제목)
+    SLIDER_SPECS = {
+        "exposure_ev": (-30, 30, "노출 (EV)"),
+        "contrast": (-100, 100, "대비"),
+        "saturation": (-100, 100, "채도"),
+        "warmth": (-100, 100, "색온도 (간이)"),
+    }
+
+    def __init__(self) -> None:
         super().__init__()
 
         self.setWindowTitle("LocalPhoto Studio")
         self.resize(1200, 800)
-        
-        
-        # 현재 불러온 원본 사진의 경로
-        # 사진을 열기 전에는 None입니다.
-        self.current_file_path = None
-        
-        # 현재 진행 중인 저장 작업 스레드
-        # 작업이 없으면 None입니다.
-        self.export_thread = None
-    
+
+        # ===== 편집 상태 =====
+
+        # controller:
+        # 편집 중 상태·확정 이력·Undo/Redo 관리자
+        self.controller = EditorController(max_steps=100)
 
         # original_image:
-        # 파일에서 불러온 원본 QImage 객체
+        # 원본 QImage, 처음에는 빈 이미지
         self.original_image = QImage()
+
+        # current_file_path:
+        # 현재 사진의 파일 경로 또는 None
+        self.current_file_path: Path | None = None
 
         # preview_source:
         # 화면 크기에 맞춰 축소한 원본 이미지 캐시
         self.preview_source = QImage()
 
         # preview_size:
-        # 캐시 생성 당시의 (가로, 세로) 크기
-        # 아직 생성 전이므로 None
-        self.preview_size = None
+        # 캐시 생성 당시의 (너비, 높이) 튜플
+        self.preview_size: tuple[int, int] | None = None
+
+        # export_thread:
+        # 현재 실행 중인 저장 스레드 또는 None
+        self.export_thread: ExportThread | None = None
+
+        # _active_key:
+        # 현재 수정 중인 보정 항목의 이름 또는 None
+        self._active_key: str | None = None
+
+        # _input_mode:
+        # 'mouse': 마우스로 드래그 중
+        # 'idle': 키보드/휠 입력 중
+        # None: 편집 작업 없음
+        self._input_mode: str | None = None
+
+        # ===== 키보드/휠 입력 타이머 =====
+
+        # 마우스 드래그에서는 이 타이머를 사용하지 않습니다.
+        self.edit_timer = QTimer(self)
+
+        self.edit_timer.setSingleShot(True)
+        self.edit_timer.setInterval(500)
+
+        self.edit_timer.timeout.connect(
+            self._finish_idle_edit
+        )
 
         # ===== 사진 표시 영역 =====
 
@@ -94,15 +151,12 @@ class MainWindow(QMainWindow):
             "font-size: 16px;"
         )
 
-        # 이미지 크기에 의해 창이 강제로 커지는 것을 방지
         self.image_label.setSizePolicy(
             QSizePolicy.Policy.Ignored,
             QSizePolicy.Policy.Ignored
         )
 
         self.image_label.setMinimumSize(1, 1)
-
-        # 이미지 표시 영역 크기 변경 이벤트 감지
         self.image_label.installEventFilter(self)
 
         # ===== 오른쪽 보정 패널 =====
@@ -110,139 +164,124 @@ class MainWindow(QMainWindow):
         panel = QWidget()
         panel.setFixedWidth(280)
 
-        # 패널 내부 위젯을 위에서 아래로 배치합니다.
         panel_layout = QVBoxLayout(panel)
 
-        # 왼쪽, 위, 오른쪽, 아래 여백
-        panel_layout.setContentsMargins(16, 20, 16, 20)
-
-        # 위젯 사이 간격
+        panel_layout.setContentsMargins(
+            16, 20, 16, 20
+        )
         panel_layout.setSpacing(14)
 
-        panel_layout.addWidget(QLabel("기본 보정"))
-
-        # add_slider()는 두 객체를 반환합니다.
-        # 첫 번째: QSlider 객체
-        # 두 번째: 현재 수치를 표시하는 QLabel 객체
-
-        self.exposure_slider, self.exposure_label = (
-            self.add_slider(
-                panel_layout, "노출", -30, 30
-            )
+        panel_layout.addWidget(
+            QLabel("기본 보정")
         )
 
-        self.contrast_slider, self.contrast_label = (
-            self.add_slider(
-                panel_layout, "대비", -100, 100
+        # sliders:
+        # 보정 항목명(str) -> EditSlider 객체
+        self.sliders: dict[str, EditSlider] = {}
+
+        # value_labels:
+        # 보정 항목명(str) -> QLabel 객체
+        self.value_labels: dict[str, QLabel] = {}
+
+        for key, (minimum, maximum, title) in (
+            self.SLIDER_SPECS.items()
+        ):
+            self._add_slider(
+                panel_layout,
+                key,
+                title,
+                minimum,
+                maximum
             )
+
+        reset_button = QPushButton(
+            "모든 보정 초기화"
         )
 
-        self.saturation_slider, self.saturation_label = (
-            self.add_slider(
-                panel_layout, "채도", -100, 100
-            )
-        )
-
-        self.warmth_slider, self.warmth_label = (
-            self.add_slider(
-                panel_layout, "색온도 (간이)", -100, 100
-            )
-        )
-
-        # ===== 초기화 버튼 =====
-
-        reset_button = QPushButton("모든 보정 초기화")
-
-        # 버튼 클릭 시 reset_adjustments() 실행
         reset_button.clicked.connect(
             self.reset_adjustments
         )
 
         panel_layout.addWidget(reset_button)
-
-        # 남는 공간을 아래쪽에 배치합니다.
         panel_layout.addStretch()
 
         # ===== 중앙 레이아웃 =====
 
         central = QWidget()
-
-        # 사진과 패널을 좌우로 배치
         main_layout = QHBoxLayout(central)
 
-        main_layout.setContentsMargins(0, 0, 0, 0)
+        main_layout.setContentsMargins(
+            0, 0, 0, 0
+        )
         main_layout.setSpacing(0)
 
-        # 사진 영역은 남는 가로 공간을 사용합니다.
         main_layout.addWidget(self.image_label, 1)
-
-        # 보정 패널은 오른쪽에 배치합니다.
         main_layout.addWidget(panel)
 
         self.setCentralWidget(central)
 
-        # 메뉴, 수치 표시, 상태바 초기화
-        self.create_menu()
-        self.update_value_labels()
+        self._create_menu()
+        self._sync_controls()
+
         self.statusBar().showMessage("준비 완료")
 
-    def add_slider(
+    def _add_slider(
         self,
         layout: QVBoxLayout,
+        key: str,
         title: str,
-        low: int,
-        high: int
-    ):
+        minimum: int,
+        maximum: int,
+    ) -> None:
         """
-        보정 슬라이더 하나를 생성합니다.
+        슬라이더 하나를 만들고 입력 신호를 연결합니다.
 
-        layout:
-            슬라이더가 추가될 Qt 레이아웃
-
-        title:
-            화면에 표시할 항목 이름(str)
-
-        low:
-            슬라이더 최솟값(int)
-
-        high:
-            슬라이더 최댓값(int)
-
-        반환값:
-            (QSlider 객체, QLabel 객체)
+        layout: 위젯을 배치할 레이아웃
+        key: 보정 항목의 필드명
+        title: 화면 표시 제목
+        minimum, maximum: 슬라이더 정수 범위
         """
 
-        # 항목 이름과 값을 가로로 배치합니다.
-        label_row = QHBoxLayout()
+        row = QHBoxLayout()
 
-        title_label = QLabel(title)
+        row.addWidget(QLabel(title))
+        row.addStretch()
+
         value_label = QLabel("0")
+        row.addWidget(value_label)
 
-        label_row.addWidget(title_label)
-        label_row.addStretch()
-        label_row.addWidget(value_label)
+        layout.addLayout(row)
 
-        layout.addLayout(label_row)
+        slider = EditSlider(
+            Qt.Orientation.Horizontal
+        )
 
-        # 가로 방향으로 움직이는 슬라이더 생성
-        slider = QSlider(Qt.Orientation.Horizontal)
-
-        slider.setRange(low, high)
+        slider.setRange(minimum, maximum)
         slider.setValue(0)
 
-        # 값이 바뀌면 보정 갱신 함수를 호출합니다.
+        # 편집 시작
+        slider.mouse_edit_started.connect(
+            lambda field=key: self._start_mouse_edit(field)
+        )
+
+        # 값 변경: 미리보기와 임시 설정 갱신
         slider.valueChanged.connect(
-            self.on_adjustments_changed
+            lambda value, field=key:
+                self._on_slider_value(field, value)
+        )
+
+        # 편집 종료
+        slider.mouse_edit_finished.connect(
+            lambda field=key: self._finish_mouse_edit(field)
         )
 
         layout.addWidget(slider)
 
-        # 생성한 두 객체를 호출한 함수에 돌려줍니다.
-        return slider, value_label
-    
-        
-    def create_menu(self):
-        """파일 메뉴를 생성합니다."""
+        self.sliders[key] = slider
+        self.value_labels[key] = value_label
+
+    def _create_menu(self) -> None:
+        """파일과 편집 메뉴를 생성합니다."""
 
         file_menu = self.menuBar().addMenu("파일")
 
@@ -257,209 +296,449 @@ class MainWindow(QMainWindow):
         )
 
         file_menu.addAction(open_action)
-        
-        # ===== 다른 이름으로 저장 =====
-        
-        # Qaction : 메뉴에서 선택하는 명령 객체
+
         self.save_action = QAction(
-            "다른 이름으로 저장...",
-            self
+            "다른 이름으로 저장...", self
         )
-        
-        # Ctrl + Shift + S 단축키 지정
+
         self.save_action.setShortcut(
-            "Ctrl+Shift+S"
+            QKeySequence("Ctrl+Shift+S")
         )
-        
-        # 메뉴 선택 시 export_image() 함수 호출
+
         self.save_action.triggered.connect(
             self.export_image
         )
-        
-        # 파일 메뉴에 저장명령 추가
-        file_menu.addAction(
-            self.save_action
-        )
-        
+
+        file_menu.addAction(self.save_action)
+        file_menu.addSeparator()
 
         exit_action = QAction("종료", self)
 
-        exit_action.triggered.connect(
-            self.close
-        )
-
-        file_menu.addSeparator()
+        exit_action.triggered.connect(self.close)
         file_menu.addAction(exit_action)
 
-    def open_image(self):
-        """사진 파일을 읽고 원본 이미지로 저장합니다."""
+        # ===== 편집 메뉴 =====
 
-        # file_path:
-        # 사용자가 선택한 파일의 전체 경로(str)
-        # 취소하면 빈 문자열을 반환합니다.
-        #
-        # _selected_filter:
-        # 선택된 파일 형식 필터 문자열
-        # 현재 사용하지 않으므로 앞에 _를 붙입니다.
-        file_path, _selected_filter = (
-            QFileDialog.getOpenFileName(
-                self,
-                "사진 열기",
-                "",
-                "이미지 (*.jpg *.jpeg *.png *.bmp *.webp);;"
-                "모든 파일 (*)"
-            )
+        edit_menu = self.menuBar().addMenu("편집")
+
+        self.undo_action = QAction(
+            "실행 취소", self
         )
 
-        if not file_path:
+        self.undo_action.setShortcut(
+            QKeySequence.StandardKey.Undo
+        )
+
+        self.undo_action.triggered.connect(
+            self.undo_adjustments
+        )
+
+        edit_menu.addAction(self.undo_action)
+
+        self.redo_action = QAction(
+            "다시 실행", self
+        )
+
+        self.redo_action.setShortcut(
+            QKeySequence("Ctrl+Y")
+        )
+
+        self.redo_action.triggered.connect(
+            self.redo_adjustments
+        )
+
+        edit_menu.addAction(self.redo_action)
+
+        self._update_history_actions()
+
+    def _start_mouse_edit(self, field: str) -> None:
+        """
+        마우스를 누른 시점에 편집을 시작합니다.
+        Qt가 슬라이더 값을 변경하기 전입니다.
+        """
+
+        if self.original_image.isNull():
             return
 
-        # 파일을 읽는 Qt 객체 생성
-        reader = QImageReader(file_path)
+        # 다른 입력 작업이 진행 중이면 먼저 확정
+        if self._active_key is not None:
+            self._finish_active_edit()
 
-        # EXIF 방향 정보를 적용합니다.
+        self.controller.begin_edit()
+
+        self._active_key = field
+        self._input_mode = "mouse"
+
+        self.edit_timer.stop()
+
+    def _on_slider_value(
+        self,
+        field: str,
+        raw_value: int
+    ) -> None:
+        """
+        슬라이더 값이 변경될 때 호출됩니다.
+
+        여기서는 history.record()를 호출하지 않습니다.
+        """
+
+        if self.original_image.isNull():
+            return
+
+        # 편집 작업이 없거나 다른 항목으로 전환된 경우
+        if self._active_key != field:
+
+            self._finish_active_edit()
+
+            self.controller.begin_edit()
+            self._active_key = field
+            self._input_mode = "idle"
+
+        # 노출은 정수/10으로 EV 변환
+        value = (
+            raw_value / 10.0
+            if field == "exposure_ev"
+            else raw_value
+        )
+
+        self.controller.set_value(
+            field, value
+        )
+
+        # 현재값을 즉시 화면에 적용합니다.
+        self._update_labels()
+        self._update_preview()
+        self._update_history_actions()
+
+        # 키보드/휠 입력일 때만 타이머 시작
+        if self._input_mode == "idle":
+            self.edit_timer.start()
+
+    def _finish_mouse_edit(self, field: str) -> None:
+        """마우스를 놓은 시점에 편집을 확정합니다."""
+
+        if (
+            self._active_key == field
+            and self._input_mode == "mouse"
+        ):
+            self._finish_active_edit()
+
+    def _finish_idle_edit(self) -> None:
+        """키보드/휠 입력이 500ms 멈춘 경우입니다."""
+
+        if self._input_mode == "idle":
+            self._finish_active_edit()
+
+    def _finish_active_edit(self) -> None:
+        """
+        실제 commit_edit()을 호출하는
+        유일한 GUI 경로입니다.
+        """
+
+        self.edit_timer.stop()
+
+        if self._active_key is None:
+            return
+
+        self.controller.commit_edit()
+
+        self._active_key = None
+        self._input_mode = None
+
+        self._update_history_actions()
+
+    def _sync_controls(self) -> None:
+        """
+        모델의 보정 설정을 GUI 슬라이더에 반영합니다.
+
+        Undo/Redo 및 사진 교체 시 사용합니다.
+        """
+
+        settings = self.controller.settings
+
+        for field, slider in self.sliders.items():
+
+            # getattr():
+            # settings 객체에서 field 이름의 속성값을 읽습니다.
+            value = getattr(settings, field)
+
+            raw = (
+                round(value * 10)
+                if field == "exposure_ev"
+                else int(value)
+            )
+
+            # 프로그램이 슬라이더 값을 바꿀 때는
+            # valueChanged 신호를 차단합니다.
+            previous_blocked = slider.blockSignals(True)
+
+            try:
+                slider.setValue(raw)
+            finally:
+                slider.blockSignals(previous_blocked)
+
+        self._update_labels()
+        self._update_preview()
+        self._update_history_actions()
+
+    def _update_labels(self) -> None:
+        """모델의 현재값으로 숫자 라벨을 표시합니다."""
+
+        s = self.controller.settings
+
+        self.value_labels["exposure_ev"].setText(
+            f"{s.exposure_ev:+.1f} EV"
+        )
+
+        for field in (
+            "contrast",
+            "saturation",
+            "warmth"
+        ):
+            self.value_labels[field].setText(
+                f"{getattr(s, field):+d}"
+            )
+
+    def _update_history_actions(self) -> None:
+        """Undo/Redo 메뉴의 활성 상태를 갱신합니다."""
+
+        loaded = not self.original_image.isNull()
+
+        self.undo_action.setEnabled(
+            loaded and self.controller.can_undo
+        )
+
+        self.redo_action.setEnabled(
+            loaded and self.controller.can_redo
+        )
+
+    def undo_adjustments(self) -> None:
+        """
+        미확정 변경이 있으면 우선 취소합니다.
+        그렇지 않으면 이전 이력을 복원합니다.
+        """
+
+        self.edit_timer.stop()
+
+        self._active_key = None
+        self._input_mode = None
+
+        self.controller.undo()
+        self._sync_controls()
+
+    def redo_adjustments(self) -> None:
+        """확정된 다음 보정 상태를 복원합니다."""
+
+        self.edit_timer.stop()
+
+        self._active_key = None
+        self._input_mode = None
+
+        self.controller.redo()
+        self._sync_controls()
+
+    def reset_adjustments(self) -> None:
+        """초기화를 하나의 편집 작업으로 기록합니다."""
+
+        if self.original_image.isNull():
+            return
+
+        self._finish_active_edit()
+
+        self.controller.begin_edit()
+
+        self.controller.set_settings(
+            AdjustmentSettings()
+        )
+
+        self.controller.commit_edit()
+        self._sync_controls()
+
+    def open_image(self) -> None:
+        """
+        새 사진을 정상적으로 읽은 후
+        이전 문서의 보정 상태를 초기화합니다.
+        """
+
+        path, _filter = QFileDialog.getOpenFileName(
+            self,
+            "사진 열기",
+            "",
+            "이미지 (*.jpg *.jpeg *.png *.bmp *.webp);;"
+            "모든 파일 (*)",
+        )
+
+        if not path:
+            return
+
+        reader = QImageReader(path)
+
+        # EXIF 회전 정보 적용
         reader.setAutoTransform(True)
 
-        # loaded_image는 QImage 객체입니다.
-        # 불러오기에 실패하면 빈 QImage가 반환됩니다.
-        loaded_image = reader.read()
+        image = reader.read()
 
-        if loaded_image.isNull():
+        if image.isNull():
             QMessageBox.critical(
                 self,
-                "오류",
-                "이미지를 불러올 수 없습니다.\n"
-                f"{reader.errorString()}"
+                "파일 열기 실패",
+                reader.errorString()
             )
             return
 
-        # 새 사진을 원본으로 저장합니다.
-        self.original_image = loaded_image
-        
-        # 현재 사진이 저장되어 있던 위치를 기억합니다.
-        # 예: C:\Photos\portrait.jpg
-        
-        self.current_file_path = Path(file_path)
-        
+        # 읽기에 성공했을 때만 기존 이력 제거
+        self.edit_timer.stop()
 
-        # 이전 사진의 축소 이미지 캐시를 제거합니다.
+        self._active_key = None
+        self._input_mode = None
+
+        self.controller.clear_document()
+
+        self.original_image = image
+        self.current_file_path = Path(path)
+
+        # 기존 미리보기 캐시 제거
         self.preview_source = QImage()
         self.preview_size = None
 
-        # 이전 사진에 적용한 보정을 초기화합니다.
-        self.reset_adjustments()
-
-        # 전체 경로에서 파일명만 추출합니다.
-        filename = Path(file_path).name
+        self._sync_controls()
 
         self.setWindowTitle(
-            f"{filename} - LocalPhoto Studio"
+            f"{self.current_file_path.name} - LocalPhoto Studio"
         )
 
         self.statusBar().showMessage(
-            f"{filename} | "
-            f"{loaded_image.width()} × "
-            f"{loaded_image.height()} px"
+            f"{self.current_file_path.name} | "
+            f"{image.width()} × {image.height()} px"
         )
-    
-    def export_image(self):
+
+    def _update_preview(self) -> None:
         """
-        파일 저장 대화상자를 열고 내보내기를 시작합니다.
+        화면용 축소 원본에 현재 보정값을 적용합니다.
         """
+
         if self.original_image.isNull():
+            return
+
+        width = self.image_label.width()
+        height = self.image_label.height()
+
+        if width < 2 or height < 2:
+            return
+
+        target_size = (width, height)
+
+        if (
+            self.preview_source.isNull()
+            or self.preview_size != target_size
+        ):
+
+            self.preview_source = self.original_image.scaled(
+                width,
+                height,
+                Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation,
+            )
+
+            self.preview_size = target_size
+
+        # 현재 보정값을 공통 모델에서 가져옵니다.
+        adjusted = apply_adjustments(
+            self.preview_source,
+            **self.controller.settings.as_kwargs()
+        )
+
+        self.image_label.setPixmap(
+            QPixmap.fromImage(adjusted)
+        )
+
+    def export_image(self) -> None:
+        """
+        사용자가 선택한 형식으로
+        원본 해상도 사진 저장을 시작합니다.
+        """
+
+        if (
+            self.original_image.isNull()
+            or self.current_file_path is None
+        ):
             QMessageBox.warning(
                 self,
                 "저장 불가",
-                "먼저 사진을 불러오세요"
+                "먼저 사진을 불러오세요."
             )
             return
-        
-        # 이미 저장 중이면 두 번째 저장을 막습니다.
+
         if self.export_thread is not None:
             return
-        
-        # 원본 파일 이름에서 기본 출력 파일명을 만듭니다.
-        #
-        # 예: portrait.jpg -> portrait_edited.jpg
-        
-        suggested_path = (
-            self.current_file_path.with_name(
-                self.current_file_path.stem
-                + "_edited.jpg"
-            )
+
+        # 기본 제안 파일명에는 확장자를 붙이지 않습니다.
+        suggested = self.current_file_path.with_name(
+            self.current_file_path.stem + "_edited"
         )
-        
-        file_filters = (
+
+        filters = (
             "JPEG 이미지 (*.jpg *.jpeg);;"
             "PNG 이미지 (*.png)"
         )
-        
-        # 파일 저장 위치를 사용자에게 선택받습니다.
-        #
-        # file_path: 선택한 저장 경로(str)
-        # selected_filter: 사용자가 선택한 파일 형식(str) 
-        
-        file_path, selected_filter =(
-            QFileDialog.getSaveFileName(
-                self,
-                "보정사진 저장",
-                str(suggested_path),
-                "JPEG 이미지 (*.jpg *.jpeg);;"
-                "PNG 이미지 (*.png)"
-            )
+
+        filename, selected_filter = QFileDialog.getSaveFileName(
+            self,
+            "보정 사진 저장",
+            str(suggested),
+            filters
         )
-        
-        # 취소
-        if not file_path:
+
+        if not filename:
             return
-        
-        # 파일명을 Path 객체로 변환합니다.
-        output_path = Path(file_path)
-        
-        # 확장자를 입력하지 않았다면 선택한 형식으로 추가
-        if not output_path.suffix:
-            extension = (
-                ".png"
-                if selected_filter.startswith("PNG")
-                else ".jpg"
-            )
-            
-            # with_suffix()는 새 Path 객체를 반환합니다.
-            # 따라서 반환값을 output_path에 다시 저장합니다.
-            output_path = output_path.with_suffix(
-                extension
-            )
-            
-        # 허용한 형식만 저장합니다.
-        if output_path.suffix.lower() not in (
+
+        output = Path(filename)
+        suffix = output.suffix.lower()
+
+        # 사용자가 선택한 파일 형식
+        preferred = (
+            ".png"
+            if selected_filter.startswith("PNG")
+            else ".jpg"
+        )
+
+        if suffix and suffix not in (
             ".jpg", ".jpeg", ".png"
         ):
             QMessageBox.warning(
                 self,
-                "지원하지 않는 형식",
-                "JPG 또는 PNG 형식만 저장합니다."
+                "형식 오류",
+                "JPG 또는 PNG 확장자만 사용합니다."
             )
             return
-        # 원본과 출력 파일의 경로를 비교합니다.
-        # resolve()는 정규화된 절대 경로를 만듭니다.
+
+        # 선택한 필터와 확장자가 다르면 필터 우선
         if (
-            output_path.resolve()
+            not suffix
+            or (preferred == ".png" and suffix != ".png")
+            or (preferred == ".jpg" and suffix == ".png")
+        ):
+            output = output.with_suffix(preferred)
+
+        # 원본 덮어쓰기 방지
+        if (
+            output.resolve()
             == self.current_file_path.resolve()
         ):
             QMessageBox.warning(
                 self,
                 "원본 보호",
-                "원본 사진은 덮어쓰지 않습니다.\n"
-                "다른 파일명으로 저장하세요."
+                "원본 파일에 덮어쓸 수 없습니다."
             )
             return
-        # 같은 이름의 파일이 존재하는 경우 확인
-        if output_path.exists():
+
+        # 기존 파일 덮어쓰기 확인
+        if output.exists():
+
             answer = QMessageBox.question(
                 self,
                 "덮어쓰기 확인",
-                "같은 이름의 파일이 있습니다.\n"
-                "기존 파일을 덮어쓰시겠습니까?",
+                f"{output.name} 파일을 덮어쓰시겠습니까?",
                 QMessageBox.StandardButton.Yes
                 | QMessageBox.StandardButton.No,
                 QMessageBox.StandardButton.No
@@ -467,295 +746,108 @@ class MainWindow(QMainWindow):
 
             if answer != QMessageBox.StandardButton.Yes:
                 return
-            # ===== 현재 보정값 저장 =====
 
-        # dict 형식으로 슬라이더 값을 수집합니다.
-        # 저장 작업 시작 시점의 값이 고정됩니다.
-        settings = {
-            "exposure_ev":
-                self.exposure_slider.value() / 10.0,
+        # snapshot:
+        # 저장 버튼을 누른 시점의 불변 보정값
+        snapshot = self.controller.settings
 
-            "contrast":
-                self.contrast_slider.value(),
-
-            "saturation":
-                self.saturation_slider.value(),
-
-            "warmth":
-                self.warmth_slider.value(),
-        }
-        # ===== 작업 스레드 생성 =====
-
-        # original_image를 전달하는 점이 중요합니다.
-        # preview_source를 전달하면 축소본이 저장됩니다.
-        self.export_thread = ExportThread(
-            source=self.original_image,
-            output_path=str(output_path),
-            settings=settings,
-            parent=self
+        thread = ExportThread(
+            self.original_image,
+            str(output),
+            snapshot,
+            self
         )
 
-        # 성공 신호와 GUI 메서드 연결
-        self.export_thread.succeeded.connect(
-            self.on_export_success
+        self.export_thread = thread
+
+        thread.succeeded.connect(
+            self._on_export_success
         )
 
-        # 오류 신호와 GUI 메서드 연결
-        self.export_thread.failed.connect(
-            self.on_export_error
+        thread.failed.connect(
+            self._on_export_error
         )
 
-        # 스레드 종료 시 정리 메서드 실행
-        self.export_thread.finished.connect(
-            self.on_export_finished
+        thread.finished.connect(
+            self._on_export_finished
         )
 
-        # 중복 저장 방지
         self.save_action.setEnabled(False)
 
         self.statusBar().showMessage(
-            "원본 해상도 사진을 저장하는 중..."
+            "원본 해상도로 저장 중..."
         )
 
-        # 별도 스레드에서 run() 실행
-        self.export_thread.start()
-        
-    def on_export_success(self, saved_path: str):
-        """
-        저장에 성공하면 실행됩니다.
+        thread.start()
 
-        saved_path:
-            실제 저장한 파일 경로(str)
-        """
+    def _on_export_success(self, path: str) -> None:
+        """저장 성공 시 GUI에 결과를 표시합니다."""
 
         self.statusBar().showMessage(
-            f"저장 완료: {saved_path}"
+            f"저장 완료: {path}"
         )
 
         QMessageBox.information(
             self,
             "저장 완료",
-            f"사진을 저장했습니다.\n{saved_path}"
+            f"사진을 저장했습니다.\n{path}"
         )
 
-    def on_export_error(self, error_message: str):
-        """
-        저장에 실패하면 실행됩니다.
+    def _on_export_error(self, message: str) -> None:
+        """저장 실패 시 오류 메시지를 표시합니다."""
 
-        error_message:
-            저장 엔진에서 전달한 오류 문자열
-        """
-
-        self.statusBar().showMessage(
-            "저장 실패"
-        )
+        self.statusBar().showMessage("저장 실패")
 
         QMessageBox.critical(
             self,
             "저장 오류",
-            error_message
+            message
         )
-    def on_export_finished(self):
-        """저장 스레드가 종료된 뒤 자원을 정리합니다."""
 
-        # 저장 메뉴를 다시 활성화합니다.
+    def _on_export_finished(self) -> None:
+        """작업이 끝나면 스레드를 정리합니다."""
+
+        thread = self.export_thread
+
+        self.export_thread = None
         self.save_action.setEnabled(True)
 
-        # Qt 객체 삭제를 이벤트 루프에 예약합니다.
-        self.export_thread.deleteLater()
+        if thread is not None:
+            thread.deleteLater()
 
-        # 작업이 끝났으므로 참조를 해제합니다.
-        self.export_thread = None
-
-    def closeEvent(self, event):
+    def closeEvent(self, event) -> None:
         """저장 중 프로그램 종료를 방지합니다."""
 
-        if (
-            self.export_thread is not None
-            and self.export_thread.isRunning()
-        ):
+        if self.export_thread is not None:
+
             QMessageBox.information(
                 self,
                 "저장 진행 중",
-                "사진 저장이 끝난 뒤 종료하세요."
+                "저장 종료 후 프로그램을 닫으세요."
             )
 
-            # 창 닫기 이벤트를 취소합니다.
             event.ignore()
             return
 
-        # 저장 중이 아니면 정상 종료
-        super().closeEvent(event)    
-        
-        
+        super().closeEvent(event)
 
+    def eventFilter(self, watched, event) -> bool:
+        """사진 표시 영역의 크기 변경을 감지합니다."""
 
-    def update_value_labels(self):
-        """현재 슬라이더의 값을 화면에 표시합니다."""
-
-        # QSlider.value()는 int를 반환합니다.
-        # EV는 10으로 나누어 float로 변환합니다.
-        exposure_ev = (
-            self.exposure_slider.value() / 10.0
-        )
-
-        self.exposure_label.setText(
-            f"{exposure_ev:+.1f} EV"
-        )
-
-        self.contrast_label.setText(
-            f"{self.contrast_slider.value():+d}"
-        )
-
-        self.saturation_label.setText(
-            f"{self.saturation_slider.value():+d}"
-        )
-
-        self.warmth_label.setText(
-            f"{self.warmth_slider.value():+d}"
-        )
-
-    def on_adjustments_changed(self, _value: int):
-        """
-        슬라이더 값이 변경되면 Qt가 호출합니다.
-
-        _value:
-            방금 움직인 슬라이더의 정수 값입니다.
-
-        이번에는 네 슬라이더의 현재값을 모두 다시
-        읽으므로 이 인수를 직접 사용하지 않습니다.
-        """
-
-        # 슬라이더 옆 숫자를 갱신합니다.
-        self.update_value_labels()
-
-        # 보정된 미리보기를 다시 계산합니다.
-        self.update_preview()
-
-    def reset_adjustments(self):
-        """모든 보정 슬라이더를 0으로 초기화합니다."""
-
-        # sliders:
-        # 초기화할 QSlider 객체들을 모은 튜플입니다.
-        sliders = (
-            self.exposure_slider,
-            self.contrast_slider,
-            self.saturation_slider,
-            self.warmth_slider,
-        )
-
-        for slider in sliders:
-            # blockSignals(True)는 Qt 신호를 일시 차단합니다.
-            # 이전 차단 상태를 돌려받아 보관합니다.
-            previous_blocked = slider.blockSignals(True)
-
-            slider.setValue(0)
-
-            # 기존 신호 차단 상태로 복구합니다.
-            slider.blockSignals(previous_blocked)
-
-        # 네 번 다시 계산하지 않고 한 번만 갱신합니다.
-        self.update_value_labels()
-        self.update_preview()
-
-    def update_preview(self):
-        """현재 보정값을 적용한 사진을 표시합니다."""
-
-        if self.original_image.isNull():
-            return
-
-        # 사진 표시 영역의 현재 크기(int)를 읽습니다.
-        target_width = self.image_label.width()
-        target_height = self.image_label.height()
-
-        if target_width < 2 or target_height < 2:
-            return
-
-        # 현재 사진 표시 영역의 크기를 튜플로 저장합니다.
-        target_size = (target_width, target_height)
-
-        # 창 크기가 바뀌었다면 캐시를 다시 만듭니다.
-        if (
-            self.preview_source.isNull()
-            or self.preview_size != target_size
-        ):
-            self.preview_source = (
-                self.original_image.scaled(
-                    target_width,
-                    target_height,
-                    Qt.AspectRatioMode.KeepAspectRatio,
-                    Qt.TransformationMode.SmoothTransformation
-                )
-            )
-
-            self.preview_size = target_size
-
-        # ===== 보정 파라미터 읽기 =====
-
-        # exposure_ev는 float입니다.
-        exposure_ev = (
-            self.exposure_slider.value() / 10.0
-        )
-
-        # 나머지는 int입니다.
-        contrast = self.contrast_slider.value()
-        saturation = self.saturation_slider.value()
-        warmth = self.warmth_slider.value()
-
-        # ===== 이미지 엔진 호출 =====
-
-        # adjusted:
-        # processing.py가 반환하는 보정된 QImage입니다.
-        #
-        # image=self.preview_source:
-        # 화면용 축소 원본을 함수에 전달합니다.
-        adjusted = apply_adjustments(
-            image=self.preview_source,
-            exposure_ev=exposure_ev,
-            contrast=contrast,
-            saturation=saturation,
-            warmth=warmth
-        )
-
-        # QImage를 화면 표시용 QPixmap으로 변환합니다.
-        self.image_label.setPixmap(
-            QPixmap.fromImage(adjusted)
-        )
-
-    def eventFilter(self, watched, event):
-        """
-        Qt 이벤트를 감지합니다.
-
-        watched:
-            이벤트가 발생한 객체입니다.
-
-        event:
-            발생한 이벤트의 종류와 정보를 담습니다.
-        """
-
-        # 사진 표시 영역의 크기가 변경되었는지 검사
         if (
             watched is self.image_label
             and event.type() == QEvent.Type.Resize
         ):
-            self.update_preview()
+            self._update_preview()
 
-        # 부모 클래스에도 이벤트를 전달합니다.
         return super().eventFilter(watched, event)
 
 
 if __name__ == "__main__":
 
-    # QApplication:
-    # 사용자 입력, 창 이벤트 등을 관리하는 객체
     app = QApplication(sys.argv)
 
-    # MainWindow 클래스의 인스턴스 생성
     window = MainWindow()
-
-    # 창을 화면에 표시합니다.
     window.show()
 
-    # Qt 이벤트 루프 실행
-    # 프로그램 종료 시 종료 코드를 반환합니다.
     sys.exit(app.exec())
