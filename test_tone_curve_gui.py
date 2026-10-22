@@ -92,5 +92,58 @@ class ToneCurveGuiTests(unittest.TestCase):
             window.close()
 
 
+    def test_exposure_slider_changes_without_name_error(self):
+        """사진을 연 뒤 노출 슬라이더 변경 및 Undo/Redo를 검증합니다.
+
+        이전에는 _on_slider_value()에서 미정의 settings 변수를
+        참조하여 슬라이더 조작 시 예외가 발생했습니다.
+        """
+        window = MainWindow()
+
+        try:
+            window.show()
+            self.app.processEvents()
+
+            image = QImage(
+                32, 32,
+                QImage.Format.Format_RGBA8888
+            )
+            image.fill(QColor(128, 128, 128))
+
+            window.original_image = image
+            window._sync_controls()
+
+            # Qt valueChanged 신호를 실제로 발생시켜 검사합니다.
+            window.sliders["exposure_ev"].setValue(10)
+
+            self.assertEqual(
+                window.controller.settings.exposure_ev,
+                1.0
+            )
+
+            # 키보드/휠 입력의 타이머 완료를 모사합니다.
+            window._finish_idle_edit()
+
+            self.assertEqual(
+                window.controller.history.length,
+                2
+            )
+
+            window.undo_adjustments()
+            self.assertEqual(
+                window.controller.settings.exposure_ev,
+                0.0
+            )
+
+            window.redo_adjustments()
+            self.assertEqual(
+                window.controller.settings.exposure_ev,
+                1.0
+            )
+
+        finally:
+            window.close()
+
+
 if __name__ == "__main__":
     unittest.main()
