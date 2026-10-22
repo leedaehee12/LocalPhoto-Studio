@@ -5,7 +5,7 @@ Qt에 의존하지 않습니다.
 """
 
 from dataclasses import replace
-
+from models import CurvePoints
 from history import AdjustmentHistory
 from models import AdjustmentSettings
 
@@ -70,7 +70,7 @@ class EditorController:
     def set_value(
         self,
         field: str,
-        value: float | int
+        value: float | int | CurvePoints
     ) -> None:
         """
         한 보정 항목을 변경합니다.

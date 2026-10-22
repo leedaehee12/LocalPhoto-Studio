@@ -30,10 +30,13 @@ from PySide6.QtWidgets import (
     QWidget
 )
 
+from histogram_widget import HistogramWidget
+from tone_curve_widget import ToneCurveWidget
 from editor_controller import EditorController
 from export_worker import ExportThread
 from models import AdjustmentSettings
 from processing import apply_adjustments
+from histogram_widget import HistogramWidget
 
 
 class EditSlider(QSlider):
@@ -171,6 +174,46 @@ class MainWindow(QMainWindow):
         )
         panel_layout.setSpacing(14)
 
+        # RGB 히스토그램: 현재 보정 미리보기의 채널 분포를 표시합니다.
+        panel_layout.addWidget(QLabel("RGB 히스토그램"))
+        self.histogram_widget = HistogramWidget()
+        panel_layout.addWidget(self.histogram_widget)
+        
+        
+        # ==========================================
+        # 톤 커브 편집 영역
+        # ==========================================
+
+        panel_layout.addWidget(
+            QLabel("톤 커브 (RGB)")
+        )
+
+        # ToneCurveWidget:
+        # 자료형: ToneCurveWidget
+        #
+        # 곡선 표시 및 제어점 조작을 담당합니다.
+        self.curve_widget = ToneCurveWidget(self)
+
+        # 사용자가 편집을 시작하면 컨트롤러에 통보
+        self.curve_widget.editStarted.connect(
+            self._start_curve_edit
+        )
+
+        # 제어점이 바뀌면 임시 설정과 미리보기 갱신
+        self.curve_widget.pointsChanged.connect(
+            self._on_curve_points_changed
+        )
+
+        # 마우스를 놓으면 최종 상태를 이력에 기록
+        self.curve_widget.editFinished.connect(
+            self._finish_curve_edit
+        )
+
+        panel_layout.addWidget(
+            self.curve_widget
+        )
+
+
         panel_layout.addWidget(
             QLabel("기본 보정")
         )
@@ -225,6 +268,7 @@ class MainWindow(QMainWindow):
 
         self.statusBar().showMessage("준비 완료")
 
+    
     def _add_slider(
         self,
         layout: QVBoxLayout,
@@ -234,13 +278,23 @@ class MainWindow(QMainWindow):
         maximum: int,
     ) -> None:
         """
-        슬라이더 하나를 만들고 입력 신호를 연결합니다.
+        기본 보정 슬라이더 하나를 생성합니다.
 
-        layout: 위젯을 배치할 레이아웃
-        key: 보정 항목의 필드명
-        title: 화면 표시 제목
-        minimum, maximum: 슬라이더 정수 범위
+        layout:
+            슬라이더가 배치될 QVBoxLayout
+
+        key:
+            보정 항목의 식별 문자열
+            예: exposure_ev
+
+        title:
+            화면에 표시할 보정 항목 이름
+
+        minimum, maximum:
+            슬라이더의 정수 범위
         """
+
+        # ===== 1. 이름과 수치 표시 =====
 
         row = QHBoxLayout()
 
@@ -248,9 +302,11 @@ class MainWindow(QMainWindow):
         row.addStretch()
 
         value_label = QLabel("0")
-        row.addWidget(value_label)
 
+        row.addWidget(value_label)
         layout.addLayout(row)
+
+        # ===== 2. 슬라이더 생성 =====
 
         slider = EditSlider(
             Qt.Orientation.Horizontal
@@ -259,26 +315,109 @@ class MainWindow(QMainWindow):
         slider.setRange(minimum, maximum)
         slider.setValue(0)
 
-        # 편집 시작
+        # ===== 3. 이벤트 연결 =====
+
+        # 마우스를 누르면 편집 시작
         slider.mouse_edit_started.connect(
-            lambda field=key: self._start_mouse_edit(field)
+            lambda field=key:
+                self._start_mouse_edit(field)
         )
 
-        # 값 변경: 미리보기와 임시 설정 갱신
+        # 값을 변경하면 미리보기 갱신
         slider.valueChanged.connect(
             lambda value, field=key:
                 self._on_slider_value(field, value)
         )
 
-        # 편집 종료
+        # 마우스를 놓으면 이력 확정
         slider.mouse_edit_finished.connect(
-            lambda field=key: self._finish_mouse_edit(field)
+            lambda field=key:
+                self._finish_mouse_edit(field)
         )
+
+        # ===== 4. 레이아웃에 배치 =====
 
         layout.addWidget(slider)
 
+        # ===== 5. 위젯 등록 =====
+
+        # 이 두 줄이 누락되어 KeyError가 발생했습니다.
         self.sliders[key] = slider
         self.value_labels[key] = value_label
+
+        
+        
+    def _start_curve_edit(self) -> None:
+        """
+        톤 커브 편집 시작.
+
+        다른 슬라이더 편집이 진행 중이라면
+        그 작업을 먼저 확정합니다.
+        """
+
+        if self.original_image.isNull():
+            return
+
+        # 직전 슬라이더 작업을 확정합니다.
+        self._finish_active_edit()
+
+        # 컨트롤러에 새 편집 시작을 알립니다.
+        self.controller.begin_edit()
+
+        # 현재 편집 중인 항목을 기록
+        self._active_key = "curve_points"
+        self._input_mode = "mouse"
+
+        # 커브 드래그에는 타이머를 사용하지 않습니다.
+        self.edit_timer.stop()
+
+    def _on_curve_points_changed(self, points) -> None:
+        """
+        톤 커브 제어점 변경을 처리합니다.
+
+        points:
+            tuple[tuple[int, int], ...] 자료형
+
+        이 함수에서는 Undo 이력을 기록하지 않습니다.
+        """
+
+        if self.original_image.isNull():
+            return
+
+        if self._active_key != "curve_points":
+            return
+
+        # EditorController의 임시 보정값 변경
+        self.controller.set_value(
+            "curve_points",
+            points
+        )
+
+        # 이미지를 새 곡선으로 다시 보정합니다.
+        #
+        # _update_preview() 내부에서 RGB 히스토그램도
+        # 함께 갱신되므로 별도 호출이 필요하지 않습니다.
+        self._update_preview()
+
+        # Undo/Redo 메뉴 상태 갱신
+        self._update_history_actions()
+
+    
+    def _finish_curve_edit(self) -> None:
+        """
+        톤 커브 조작이 종료되면 호출합니다.
+
+        드래그 도중의 모든 값 변경을
+        하나의 Undo 이력으로 확정합니다.
+        """
+
+        # 현재 편집 대상이 톤 커브인지 확인
+        if self._active_key != "curve_points":
+            return
+
+        # GUI의 공통 편집 확정 메서드 사용
+        self._finish_active_edit()
+
 
     def _create_menu(self) -> None:
         """파일과 편집 메뉴를 생성합니다."""
@@ -371,46 +510,55 @@ class MainWindow(QMainWindow):
 
         self.edit_timer.stop()
 
+    
     def _on_slider_value(
         self,
         field: str,
         raw_value: int
     ) -> None:
         """
-        슬라이더 값이 변경될 때 호출됩니다.
+        기본 보정 슬라이더 값이 변경되면 호출합니다.
 
-        여기서는 history.record()를 호출하지 않습니다.
+        드래그 중에는 임시 상태와 미리보기만 갱신합니다.
+        편집 이력은 여기서 직접 기록하지 않습니다.
         """
 
         if self.original_image.isNull():
             return
 
-        # 편집 작업이 없거나 다른 항목으로 전환된 경우
+        # 다른 항목으로 편집 대상이 변경되었다면
+        # 이전 작업을 먼저 확정합니다.
         if self._active_key != field:
 
             self._finish_active_edit()
 
             self.controller.begin_edit()
+
             self._active_key = field
             self._input_mode = "idle"
 
-        # 노출은 정수/10으로 EV 변환
+        # 노출은 QSlider 정수값을 EV로 변환합니다.
         value = (
             raw_value / 10.0
             if field == "exposure_ev"
             else raw_value
         )
 
+        # 현재 편집 중인 보정값 변경
         self.controller.set_value(
-            field, value
+            field,
+            value
         )
 
-        # 현재값을 즉시 화면에 적용합니다.
+        # 숫자 표시 및 이미지 미리보기 갱신
         self._update_labels()
         self._update_preview()
+
+        # Undo/Redo 메뉴 갱신
         self._update_history_actions()
 
-        # 키보드/휠 입력일 때만 타이머 시작
+        # 키보드나 마우스 휠 입력에서만
+        # 500ms 타이머를 사용합니다.
         if self._input_mode == "idle":
             self.edit_timer.start()
 
@@ -447,19 +595,20 @@ class MainWindow(QMainWindow):
 
         self._update_history_actions()
 
+    
     def _sync_controls(self) -> None:
         """
-        모델의 보정 설정을 GUI 슬라이더에 반영합니다.
+        모델의 보정 설정을 GUI에 반영합니다.
 
         Undo/Redo 및 사진 교체 시 사용합니다.
         """
 
         settings = self.controller.settings
 
+        # ===== 1. 기본 보정 슬라이더 동기화 =====
+
         for field, slider in self.sliders.items():
 
-            # getattr():
-            # settings 객체에서 field 이름의 속성값을 읽습니다.
             value = getattr(settings, field)
 
             raw = (
@@ -468,8 +617,8 @@ class MainWindow(QMainWindow):
                 else int(value)
             )
 
-            # 프로그램이 슬라이더 값을 바꿀 때는
-            # valueChanged 신호를 차단합니다.
+            # 프로그램이 값을 바꿀 때는
+            # valueChanged 신호가 발생하지 않도록 차단
             previous_blocked = slider.blockSignals(True)
 
             try:
@@ -477,9 +626,24 @@ class MainWindow(QMainWindow):
             finally:
                 slider.blockSignals(previous_blocked)
 
+        # ===== 2. 톤 커브 동기화 (새로 추가한 부분) =====
+
+        # 현재 모델에 저장된 제어점을 GUI에 반영
+        self.curve_widget.set_points(
+            settings.curve_points
+        )
+
+        # 이미지가 로드된 경우에만 조작 허용
+        self.curve_widget.setEnabled(
+            not self.original_image.isNull()
+        )
+
+        # ===== 3. 화면 갱신 =====
+
         self._update_labels()
         self._update_preview()
         self._update_history_actions()
+
 
     def _update_labels(self) -> None:
         """모델의 현재값으로 숫자 라벨을 표시합니다."""
@@ -651,6 +815,9 @@ class MainWindow(QMainWindow):
         self.image_label.setPixmap(
             QPixmap.fromImage(adjusted)
         )
+
+        # 표시된 이미지와 동일한 결과로 히스토그램을 갱신합니다.
+        self.histogram_widget.set_image(adjusted)
 
     def export_image(self) -> None:
         """
