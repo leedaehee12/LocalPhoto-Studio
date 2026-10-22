@@ -9,29 +9,67 @@ GUI·Undo·파일 저장을 알 필요가 없는
 import numpy as np
 from PySide6.QtGui import QImage
 
+# 공통 보정 설정에 정의된 기본 커브와 자료형
+from models import (
+    CurvePoints,
+    IDENTITY_CURVE
+)
+
+# 이전 단계에서 작성한 톤 커브 계산 엔진
+from tone_curve import (
+    build_curve_lut,
+    apply_curve_pixels
+)
+
 
 def apply_adjustments(
     image: QImage,
+
+    # 노출 보정
     exposure_ev: float = 0.0,
+
+    # 대비
     contrast: int = 0,
+
+    # 채도
     saturation: int = 0,
+
+    # 간이 색온도
     warmth: int = 0,
+
+    # 톤 커브 제어점
+    #
+    # 기본값은 입력 밝기와 출력 밝기가
+    # 동일한 항등 변환 곡선입니다.
+    curve_points: CurvePoints = IDENTITY_CURVE
+
 ) -> QImage:
     """
-    QImage를 보정해 독립적인 새 QImage를 반환합니다.
-    입력받은 원본 이미지는 수정하지 않습니다.
+    보정값을 이용해 새 QImage를 반환합니다.
+
+    처리 순서:
+    1. QImage → NumPy
+    2. sRGB → 선형 RGB
+    3. 노출 / 색온도 / 대비 / 채도
+    4. 선형 RGB → sRGB
+    5. 톤 커브 LUT 적용
+    6. 새 QImage 반환
+
+    원본 QImage는 직접 수정하지 않습니다.
     """
 
-    # 비어 있는 이미지인지 확인
+    # 이미지가 비어 있으면 빈 QImage 반환
     if image.isNull():
         return QImage()
 
-    # 모든 보정값이 0이면 계산할 필요가 없습니다.
+    # 모든 보정값이 기본 상태인 경우
+    # 별도 계산 없이 이미지 사본을 반환합니다.
     if (
-        exposure_ev == 0
+        exposure_ev == 0.0
         and contrast == 0
         and saturation == 0
         and warmth == 0
+        and curve_points == IDENTITY_CURVE
     ):
         return image.copy()
 
@@ -157,16 +195,47 @@ def apply_adjustments(
         1.055 * (linear ** (1.0 / 2.4)) - 0.055,
     )
 
-    # 0~255 uint8 RGB 배열로 변환합니다.
+    # sRGB 값을 8비트 RGB로 변환합니다.
     pixels[:, :, :3] = (
         np.rint(srgb * 255)
         .clip(0, 255)
         .astype(np.uint8)
     )
 
-    # ===== 8. QImage 반환 =====
+    # ==========================================
+    # 8. 톤 커브 적용
+    # ==========================================
 
-    # NumPy 배열의 메모리를 참조하는 QImage 생성
+    # 기본 커브라면 변환이 필요하지 않습니다.
+    if curve_points != IDENTITY_CURVE:
+
+        # lut:
+        # 자료형: np.ndarray
+        # 크기: (256,)
+        # dtype: uint8
+        #
+        # 입력 밝기 0~255에 대응하는
+        # 출력 밝기 256개를 계산합니다.
+        lut = build_curve_lut(curve_points)
+
+        # pixels:
+        # shape=(height, width, 4)
+        #
+        # RGB 채널에만 LUT를 적용하며
+        # 알파 채널은 그대로 유지합니다.
+        #
+        # apply_curve_pixels()는 새 배열을 반환하므로
+        # 반환값을 다시 pixels에 저장합니다.
+        pixels = apply_curve_pixels(
+            pixels,
+            lut
+        )
+
+    # ==========================================
+    # 9. QImage 반환
+    # ==========================================
+
+    # NumPy 배열을 참조하는 QImage 생성
     result = QImage(
         pixels.data,
         width,
@@ -175,5 +244,5 @@ def apply_adjustments(
         QImage.Format.Format_RGBA8888
     )
 
-    # 메모리 소유권을 분리한 이미지 반환
+    # Qt가 독립적으로 소유하는 이미지 사본 반환
     return result.copy()
