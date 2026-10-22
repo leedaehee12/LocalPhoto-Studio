@@ -562,30 +562,6 @@ class MainWindow(QMainWindow):
         if self._input_mode == "idle":
             self.edit_timer.start()
 
-        
-        
-        # ==========================================
-        # 톤 커브 그래프 동기화
-        # ==========================================
-
-        # 현재 모델에 저장된 제어점을 표시합니다.
-        #
-        # set_points()는 pointsChanged 신호를
-        # 발생시키지 않으므로 새 이력은 생기지 않습니다.
-        self.curve_widget.set_points(
-            settings.curve_points
-        )
-
-        # 이미지가 없을 때는 편집을 차단합니다.
-        self.curve_widget.setEnabled(
-            not self.original_image.isNull()
-        )
-
-
-        # 키보드/휠 입력일 때만 타이머 시작
-        if self._input_mode == "idle":
-            self.edit_timer.start()
-
     def _finish_mouse_edit(self, field: str) -> None:
         """마우스를 놓은 시점에 편집을 확정합니다."""
 
