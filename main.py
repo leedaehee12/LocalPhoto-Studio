@@ -34,6 +34,7 @@ from editor_controller import EditorController
 from export_worker import ExportThread
 from models import AdjustmentSettings
 from processing import apply_adjustments
+from histogram_widget import HistogramWidget
 
 
 class EditSlider(QSlider):
@@ -170,6 +171,11 @@ class MainWindow(QMainWindow):
             16, 20, 16, 20
         )
         panel_layout.setSpacing(14)
+
+        # RGB 히스토그램: 현재 보정 미리보기의 채널 분포를 표시합니다.
+        panel_layout.addWidget(QLabel("RGB 히스토그램"))
+        self.histogram_widget = HistogramWidget()
+        panel_layout.addWidget(self.histogram_widget)
 
         panel_layout.addWidget(
             QLabel("기본 보정")
@@ -651,6 +657,9 @@ class MainWindow(QMainWindow):
         self.image_label.setPixmap(
             QPixmap.fromImage(adjusted)
         )
+
+        # 표시된 이미지와 동일한 결과로 히스토그램을 갱신합니다.
+        self.histogram_widget.set_image(adjusted)
 
     def export_image(self) -> None:
         """
